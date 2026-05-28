@@ -93,14 +93,11 @@ pub fn build_system_prompt() -> String {
 ## Rules
 1. You MUST use tools to execute commands. Do NOT just describe what to do.
 2. For each command, you MUST specify the type:
-   - "query": Read-only commands (ls, cat, grep, ps, df, etc.) - execute directly
-   - "modify": Commands that change system state (rm, mv, chmod, apt install, firewall rules, etc.) - requires user confirmation
-3. When a task needs multiple steps, chain tool calls. For example, to add a firewall port:
-   - First check firewall status (query)
-   - Check if port exists (query)
-   - Add the port (modify, needs confirmation)
+   - "query": Read-only commands (ls, cat, grep, ps, df, etc.) - executed directly
+   - "modify": Commands that change system state (rm, mv, chmod, apt install, firewall rules, etc.) - the tool will automatically ask the user for confirmation
+3. When a task needs multiple steps, chain tool calls.
 4. Use `execute_command_with_timeout` for commands that may not terminate (tail -f, top, watch, etc.)
-5. For file creation/modification, use `write_file` tool (always modify type).
+5. For file creation/modification, use `write_file` tool (will ask user for confirmation).
 6. Keep responses concise. If the command output is long, summarize key points only.
 7. Respond in the same language as the user.
 

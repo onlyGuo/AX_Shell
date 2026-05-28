@@ -185,9 +185,6 @@ fn run_agent(cfg: &config::Config, user_prompt: &str) -> Result<(), String> {
 
         // Process tool calls
         for tool_call in &resp.tool_calls {
-            let cmd_type = tool_call.arguments["type"].as_str().unwrap_or("query");
-            let needs_confirm = cmd_type == "modify";
-
             let display_cmd = match tool_call.name.as_str() {
                 "execute_command" | "execute_command_with_timeout" => {
                     tool_call.arguments["command"]
@@ -201,18 +198,6 @@ fn run_agent(cfg: &config::Config, user_prompt: &str) -> Result<(), String> {
                 }
                 _ => format!("{}({})", tool_call.name, tool_call.arguments),
             };
-
-            if needs_confirm {
-                if !display::prompt_confirmation(&display_cmd) {
-                    messages.push(json!({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": "User denied execution of this command.",
-                    }));
-                    display::print_info("Command denied by user.");
-                    continue;
-                }
-            }
 
             display::print_execute(&display_cmd);
             let result = tools::execute_tool_call(tool_call);

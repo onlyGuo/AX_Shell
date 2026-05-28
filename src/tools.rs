@@ -97,16 +97,43 @@ pub fn execute_tool_call(tool_call: &ToolCall) -> ToolResult {
     match tool_call.name.as_str() {
         "execute_command" => {
             let command = tool_call.arguments["command"].as_str().unwrap_or("");
+            let cmd_type = tool_call.arguments["type"].as_str().unwrap_or("query");
+            if cmd_type == "modify" {
+                let display_cmd = command.to_string();
+                if !crate::display::prompt_confirmation(&display_cmd) {
+                    return ToolResult {
+                        content: "User denied execution of this command.".to_string(),
+                        is_error: false,
+                    };
+                }
+            }
             execute_command(command, None)
         }
         "execute_command_with_timeout" => {
             let command = tool_call.arguments["command"].as_str().unwrap_or("");
             let timeout = tool_call.arguments["timeout_seconds"].as_u64().unwrap_or(30);
+            let cmd_type = tool_call.arguments["type"].as_str().unwrap_or("query");
+            if cmd_type == "modify" {
+                let display_cmd = command.to_string();
+                if !crate::display::prompt_confirmation(&display_cmd) {
+                    return ToolResult {
+                        content: "User denied execution of this command.".to_string(),
+                        is_error: false,
+                    };
+                }
+            }
             execute_command(command, Some(timeout))
         }
         "write_file" => {
             let path = tool_call.arguments["path"].as_str().unwrap_or("");
             let content = tool_call.arguments["content"].as_str().unwrap_or("");
+            let display_cmd = format!("write file: {path}");
+            if !crate::display::prompt_confirmation(&display_cmd) {
+                return ToolResult {
+                    content: "User denied execution of this command.".to_string(),
+                    is_error: false,
+                };
+            }
             write_file(path, content)
         }
         _ => ToolResult {
