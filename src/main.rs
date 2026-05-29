@@ -79,10 +79,43 @@ fn run_agent(cfg: &config::Config, user_prompt: &str) -> Result<(), String> {
     let mut all_reasoning = String::new();
     let mut all_message = String::new();
     let mut executed_commands: Vec<String> = Vec::new();
-    let max_rounds = 20;
+    let mut request_start_idx = messages.len();
+    let max_context_chars: usize = 4_000_000; // ~1M tokens
+    let mut round: usize = 0;
 
-    for _round in 0..max_rounds {
-        debug_log(&format!("=== Round {} ===", _round + 1));
+    loop {
+        // Every 20 tool-call rounds, compress previous rounds via LLM summarization
+        if round > 0 && round.is_multiple_of(20) {
+            display::print_info(&format!(
+                "Compressing context at round {round}..."
+            ));
+            match compress_tool_messages_via_llm(cfg, &mut messages, request_start_idx, &system_prompt) {
+                Ok(new_start) => {
+                    request_start_idx = new_start;
+                    display::print_info("Context compressed. Continuing...");
+                }
+                Err(e) => {
+                    display::print_info(&format!("Compression failed ({e}), continuing without compression."));
+                }
+            }
+            debug_log(&format!("After compression at round {round}, messages count: {}", messages.len()));
+        }
+
+        // Check total context size (~1M tokens ≈ 4M chars)
+        let total_chars: usize = messages
+            .iter()
+            .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0))
+            .sum::<usize>()
+            + system_prompt.len();
+        if total_chars > max_context_chars {
+            display::print_error(&format!(
+                "Context limit reached (~1M tokens, {total_chars} chars). Stopping after {round} rounds."
+            ));
+            context::append_history(user_prompt, &all_message, &all_reasoning, executed_commands);
+            return Ok(());
+        }
+
+        debug_log(&format!("=== Round {} ===", round + 1));
         debug_log(&format!("Messages count: {}", messages.len()));
         for (i, msg) in messages.iter().enumerate() {
             let role = msg["role"].as_str().unwrap_or("?");
@@ -222,11 +255,136 @@ fn run_agent(cfg: &config::Config, user_prompt: &str) -> Result<(), String> {
             debug_log(&format!("  tool_result: {}", serde_json::to_string(&tool_msg).unwrap_or_default()));
             messages.push(tool_msg);
         }
+
+        round += 1;
+    }
+}
+
+/// Compress tool call rounds using LLM summarization.
+/// Sends the accumulated tool call history to the LLM for a concise summary,
+/// then replaces those messages with the summary.
+fn compress_tool_messages_via_llm(
+    cfg: &config::Config,
+    messages: &mut Vec<Value>,
+    start_idx: usize,
+    system_prompt: &str,
+) -> Result<usize, String> {
+    // Extract tool call history into a readable format
+    let mut tool_entries: Vec<String> = Vec::new();
+    let mut i = start_idx;
+    let mut tool_index: usize = 1;
+
+    while i < messages.len() {
+        let msg = &messages[i];
+        let role = msg["role"].as_str().unwrap_or("");
+
+        if role == "assistant" {
+            let mut call_infos: Vec<(String, String)> = Vec::new();
+
+            // OpenAI format
+            if let Some(calls) = msg["tool_calls"].as_array() {
+                for call in calls {
+                    let name = call["function"]["name"].as_str().unwrap_or("");
+                    let args = call["function"]["arguments"].as_str().unwrap_or("{}");
+                    let id = call["id"].as_str().unwrap_or("");
+                    call_infos.push((format!("{name}({args})"), id.to_string()));
+                }
+            }
+            // Anthropic format
+            if let Some(arr) = msg["content"].as_array() {
+                for block in arr {
+                    if block["type"].as_str() == Some("tool_use") {
+                        let name = block["name"].as_str().unwrap_or("");
+                        let input = serde_json::to_string(&block["input"])
+                            .unwrap_or_else(|_| "{}".to_string());
+                        let id = block["id"].as_str().unwrap_or("");
+                        call_infos.push((format!("{name}({input})"), id.to_string()));
+                    }
+                }
+            }
+
+            for (call_desc, call_id) in &call_infos {
+                let mut result_preview = String::new();
+                for rmsg in messages.iter().skip(i + 1) {
+                    if rmsg["role"].as_str() == Some("tool")
+                        && rmsg["tool_call_id"].as_str() == Some(call_id.as_str())
+                    {
+                        let content = rmsg["content"].as_str().unwrap_or("");
+                        let preview: String = content.chars().take(200).collect();
+                        if content.chars().count() > 200 {
+                            result_preview = format!("{preview}...");
+                        } else {
+                            result_preview = preview;
+                        }
+                        break;
+                    }
+                }
+                tool_entries.push(format!(
+                    "[{tool_index}] {call_desc}\n  => {result_preview}"
+                ));
+                tool_index += 1;
+            }
+        }
+        i += 1;
     }
 
-    display::print_error("Maximum tool call rounds exceeded (20). Stopping.");
-    context::append_history(user_prompt, &all_message, &all_reasoning, executed_commands);
-    Ok(())
+    if tool_entries.is_empty() {
+        return Ok(start_idx);
+    }
+
+    let tool_history_text = tool_entries.join("\n\n");
+
+    // Build summarization messages
+    let summary_system = format!(
+        "{system_prompt}\n\n\
+         ## Current Task: Context Compression\n\
+         You are summarizing your own tool call history to compress context. \
+         Produce a concise summary that:\n\
+         1. Lists what commands/actions were executed and their key outcomes\n\
+         2. Preserves errors, important file paths, and critical findings\n\
+         3. Notes the current progress/state of the task\n\
+         4. Omit verbose output, repeated patterns, trivial details\n\
+         5. Respond in the same language as the original user request\n\n\
+         Keep the summary under 2000 characters. Be factual and precise."
+    );
+
+    let summary_messages = vec![
+        json!({"role": "user", "content": format!(
+            "Summarize the following {count} tool calls into a concise report:\n\n{history}",
+            count = tool_entries.len(),
+            history = tool_history_text,
+        )}),
+    ];
+
+    // Call LLM silently for summarization
+    let events = protocol::call_llm_streaming(cfg, &summary_messages, &summary_system, |_| {})?;
+
+    // Extract summary from response
+    let summary = events
+        .iter()
+        .find_map(|e| match e {
+            protocol::StreamEvent::Done(r) => Some(r.message.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "[Context compression failed: no response from LLM]".to_string());
+
+    let summary = summary.trim();
+
+    debug_log(&format!(
+        "Compressed {} tool calls into {} chars summary",
+        tool_entries.len(),
+        summary.len()
+    ));
+
+    // Replace tool call messages with the compressed summary
+    messages.truncate(start_idx);
+    messages.push(json!({"role": "user", "content": format!(
+        "[Compressed Tool History - {} calls summarized]\n{}",
+        tool_entries.len(),
+        summary
+    )}));
+
+    Ok(messages.len())
 }
 
 fn handle_settings(args: &[String]) {
